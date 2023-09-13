@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <concepts>
 #include <cstddef>
 #include <expected>
 #include <format>
@@ -24,15 +25,9 @@ namespace cozy
     template <typename T>
     using expected = std::expected<T, std::string>;
 
-    using result_t = expected<bool>;
-
     struct parse_arg_t
     {
-        parse_arg_t(std::function<result_t(std::string_view)> fn,
-                    bool allow_empty)
-            : fn{fn}, allow_empty{allow_empty}
-        {
-        }
+        using result_t = expected<bool>;
         auto operator()(std::string_view s) { return fn(s); }
 
         std::function<result_t(std::string_view)> fn;
@@ -41,7 +36,7 @@ namespace cozy
 
     namespace detail
     {
-        inline constexpr bool valid_name(std::string_view name)
+        inline constexpr bool invalid_name(std::string_view name)
         {
             return !name.starts_with('-') ||
                    (name.size() > 2 && name[1] != '-') || name == "--" ||
@@ -68,7 +63,7 @@ namespace cozy
         };
 
         template <typename T>
-            requires std::is_integral_v<T> || std::is_floating_point_v<T>
+            requires std::is_integral_v<T>
         expected<bool> builtin_parse(std::string_view s, T& x)
         {
             auto begin = s.data();
@@ -78,6 +73,37 @@ namespace cozy
                 return std::unexpected{std::format("cannot parse {} as {}", s,
                                                    typestring::name<T>)};
             return false;
+        }
+
+        template <typename T>
+            requires std::is_floating_point_v<T>
+        expected<bool> builtin_parse(std::string_view s, T& x)
+        {
+#if __cpp_lib_to_chars >= 201611L
+            auto begin = s.data();
+            auto end = s.data() + s.size();
+            auto [ptr, ec] = std::from_chars(begin, end, x);
+            if(ec != std::errc() || ptr != end)
+                return std::unexpected{std::format("cannot parse {} as {}", s,
+                                                   typestring::name<T>)};
+            return false;
+#else
+            try
+            {
+                if constexpr(std::is_same_v<double, T>)
+                    x = stod(std::string(s));
+                else if constexpr(std::is_same_v<float, T>)
+                    x = stof(std::string(s));
+                else
+                    x = stold(std::string(s));
+                return false;
+            }
+            catch(...)
+            {
+                return std::unexpected{std::format("cannot parse {} as {}", s,
+                                                   typestring::name<T>)};
+            }
+#endif
         }
 
         inline expected<bool> builtin_parse(std::string_view s, bool& x)
@@ -124,7 +150,7 @@ namespace cozy
 
         consteval flag_name_t(std::string_view name) : str{name}
         {
-            if(!detail::valid_name(name))
+            if(detail::invalid_name(name))
                 throw std::runtime_error("invalid flag name");
         }
 
@@ -138,8 +164,9 @@ namespace cozy
     template <builtin_parseable T>
     inline parse_arg_t make_parse_arg(T& target)
     {
-        auto fn = [&target](std::string_view s) { builtin_parse(s, target); };
-        return {fn, std::is_same_v<T, bool>};
+        auto fn = [&target](std::string_view s)
+        { return detail::builtin_parse(s, target); };
+        return parse_arg_t{.fn = fn, .allow_empty = std::is_same_v<T, bool>};
     }
 
     class parser_t
@@ -147,15 +174,15 @@ namespace cozy
         static constexpr std::string_view plain_args_key = "";
 
       public:
-        expected<std::vector<std::string_view>>
-        parse(std::span<std::string_view> args)
+        template <std::convertible_to<std::string_view> String>
+        expected<std::vector<std::string_view>> parse(std::span<String> args)
         {
             std::vector<std::string_view> remaining;
             bool more_flags = true;
             parse_arg_t* parse_arg = nullptr;
             for(int i = 0; i < args.size(); i++)
             {
-                auto arg = args[i];
+                std::string_view arg = args[i];
                 if(arg.size() == 0)
                     continue;
 
@@ -164,8 +191,9 @@ namespace cozy
                     if(parse_arg)
                     {
                         if(!parse_arg->allow_empty)
-                            return std::unexpected{std::format(
-                                "missing value after {}", args[i - 1])};
+                            return std::unexpected{
+                                std::format("missing value after {}",
+                                            std::string_view{args[i - 1]})};
                         auto result = (*parse_arg)(""sv);
                         if(!result)
                             return std::unexpected{result.error()};
@@ -194,18 +222,6 @@ namespace cozy
                     if(!result.value())
                         parse_arg = nullptr;
                 }
-                else
-                {
-                    auto it = parse_args.find(plain_args_key);
-                    if(it == parse_args.end())
-                    {
-                        remaining.push_back(arg);
-                        continue;
-                    }
-                    auto result = it->second(arg);
-                    if(!result)
-                        return std::unexpected{result.error()};
-                }
             }
 
             return remaining;
@@ -220,27 +236,10 @@ namespace cozy
         expected<void> vflag(std::string_view name, std::string_view help,
                              parse_arg_t parse_arg)
         {
-            if(!detail::valid_name(name))
+            if(detail::invalid_name(name))
                 return std::unexpected{
                     std::format("invalid flag name {}", name)};
             return unguarded_vflag(name, help, parse_arg);
-        }
-
-        expected<void> plain_args(std::string_view help,
-                                  builtin_parseable auto& target)
-        {
-            auto parse_fn = [&target](std::string_view s)
-            { builtin_parse(s, target); };
-
-            if(parse_args.find(plain_args_key) != parse_args.end())
-            {
-                return std::unexpected{
-                    std::format("trailing args already set")};
-            }
-
-            parse_args[plain_args_key] = parse_fn;
-            help_strs.push_back({plain_args_key, help});
-            return {};
         }
 
       private:
