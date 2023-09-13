@@ -12,6 +12,7 @@
 #include <limits>
 #include <ranges>
 #include <span>
+#include <sstream>
 #include <stdexcept>
 #include <string_view>
 #include <type_traits>
@@ -177,16 +178,17 @@ namespace cozy
         template <std::convertible_to<std::string_view> String>
         expected<std::vector<std::string_view>> parse(std::span<String> args)
         {
+            program_name = args[0];
+            args = args.subspan(1);
+
             std::vector<std::string_view> remaining;
-            bool more_flags = true;
             parse_arg_t* parse_arg = nullptr;
-            for(int i = 0; i < args.size(); i++)
+
+            int i = 0;
+            for(; i < args.size(); i++)
             {
                 std::string_view arg = args[i];
-                if(arg.size() == 0)
-                    continue;
-
-                if(more_flags && arg.starts_with('-'))
+                if(arg.starts_with('-'))
                 {
                     if(parse_arg)
                     {
@@ -202,8 +204,8 @@ namespace cozy
 
                     if(arg == "--")
                     {
-                        more_flags = false;
-                        continue;
+                        i++;
+                        break;
                     }
 
                     auto it = parse_args.find(arg);
@@ -222,43 +224,83 @@ namespace cozy
                     if(!result.value())
                         parse_arg = nullptr;
                 }
+                else
+                {
+                    remaining.push_back(arg);
+                }
             }
+
+            if(parse_arg)
+            {
+                if(!parse_arg->allow_empty)
+                    return std::unexpected{
+                        std::format("missing value after {}",
+                                    std::string_view{args.back()})};
+                auto result = (*parse_arg)(""sv);
+                if(!result)
+                    return std::unexpected{result.error()};
+            }
+
+            for(; i < args.size(); i++)
+                remaining.push_back(args[i]);
 
             return remaining;
         }
 
-        expected<void> flag(flag_name_t name, std::string_view help,
-                            builtin_parseable auto& target)
+        void flag(flag_name_t name, std::string_view help,
+                  builtin_parseable auto& target)
         {
-            return unguarded_vflag(name.str, help, make_parse_arg(target));
+            unguarded_vflag(name.str, help, make_parse_arg(target));
         }
 
-        expected<void> vflag(std::string_view name, std::string_view help,
-                             parse_arg_t parse_arg)
+        void vflag(std::string_view name, std::string_view help,
+                   parse_arg_t parse_arg)
         {
             if(detail::invalid_name(name))
-                return std::unexpected{
+                throw std::runtime_error{
                     std::format("invalid flag name {}", name)};
-            return unguarded_vflag(name, help, parse_arg);
+            unguarded_vflag(name, help, parse_arg);
+        }
+
+        void usage_to(std::ostream& os) const
+        {
+            using namespace std::ranges;
+
+            if(program_name.size() > 0)
+                os << std::format("Usage of {}:\n", program_name);
+            else
+                os << std::format("Usage:\n");
+
+            int longest =
+                max(help_strs |
+                    views::transform([](auto& hs) { return hs.first.size(); }));
+            for(auto [name, help] : help_strs)
+                os << std::format("    {:{}}{}\n", name, longest + 4, help);
+        }
+
+        std::string usage() const
+        {
+            std::stringstream ss;
+            usage_to(ss);
+            return ss.str();
         }
 
       private:
         std::unordered_map<std::string_view, parse_arg_t> parse_args;
         std::vector<std::pair<std::string_view, std::string_view>> help_strs;
+        std::string_view program_name;
 
-        expected<void> unguarded_vflag(std::string_view name,
-                                       std::string_view help,
-                                       parse_arg_t parse_arg)
+        void unguarded_vflag(std::string_view name, std::string_view help,
+                             parse_arg_t parse_arg)
         {
-            if(parse_args.find(name) != parse_args.end())
+            if(parse_args.contains(name))
             {
-                return std::unexpected{
+                throw std::runtime_error{
                     std::format("flag {} already exists", name)};
             }
 
             parse_args[name] = parse_arg;
             help_strs.push_back({name, help});
-            return {};
         }
     };
 
