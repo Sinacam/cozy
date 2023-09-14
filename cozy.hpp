@@ -40,15 +40,15 @@ namespace cozy
 
         // disallowing cv qualifiers is deliberate
         template <typename T>
-        inline constexpr bool is_single_parseable_v =
+        concept single_parseable =
             is_in<T, std::string_view, std::string, bool> ||
             std::is_integral_v<T> || std::is_floating_point_v<T>;
 
         template <typename T>
-        inline constexpr bool is_parseable_container_v = requires(T x) {
+        concept parseable_container = requires(T x) {
             typename T::value_type;
             requires !is_in<T, std::string, std::string_view>;
-            requires is_single_parseable_v<typename T::value_type>;
+            requires single_parseable<typename T::value_type>;
             requires std::is_default_constructible_v<typename T::value_type>;
             {
                 x.push_back(std::declval<typename T::value_type>())
@@ -57,11 +57,11 @@ namespace cozy
 
         template <typename T>
             requires std::is_integral_v<T>
-        expected<bool> builtin_parse(std::string_view s, T& x)
+        expected<bool> builtin_parse(std::string_view s, T* target)
         {
             auto begin = s.data();
             auto end = s.data() + s.size();
-            auto [ptr, ec] = std::from_chars(begin, end, x);
+            auto [ptr, ec] = std::from_chars(begin, end, *target);
             if(ec != std::errc() || ptr != end)
                 return std::unexpected{std::format("cannot parse {} as {}", s,
                                                    typestring::name<T>)};
@@ -70,12 +70,12 @@ namespace cozy
 
         template <typename T>
             requires std::is_floating_point_v<T>
-        expected<bool> builtin_parse(std::string_view s, T& x)
+        expected<bool> builtin_parse(std::string_view s, T* target)
         {
 #if __cpp_lib_to_chars >= 201611L
             auto begin = s.data();
             auto end = s.data() + s.size();
-            auto [ptr, ec] = std::from_chars(begin, end, x);
+            auto [ptr, ec] = std::from_chars(begin, end, *target);
             if(ec != std::errc() || ptr != end)
                 return std::unexpected{std::format("cannot parse {} as {}", s,
                                                    typestring::name<T>)};
@@ -95,17 +95,17 @@ namespace cozy
             if(str_end == str.c_str() || (str_end - str.c_str()) != s.size())
                 return std::unexpected{std::format("cannot parse {} as {}", s,
                                                    typestring::name<T>)};
-            x = tmp;
+            *target = tmp;
             return false;
 #endif
         }
 
-        inline expected<bool> builtin_parse(std::string_view s, bool& x)
+        inline expected<bool> builtin_parse(std::string_view s, bool* target)
         {
-            if(s == ""sv || s == "true"sv)
-                x = true;
+            if(s.data() == nullptr || s == "true"sv)
+                *target = true;
             else if(s == "false"sv)
-                x = false;
+                *target = false;
             else
                 return std::unexpected{
                     std::format("cannot parse {} as bool", s)};
@@ -114,24 +114,46 @@ namespace cozy
 
         template <typename T>
             requires is_in<T, std::string_view, std::string>
-        expected<bool> builtin_parse(std::string_view s, T& x)
+        expected<bool> builtin_parse(std::string_view s, T* target)
         {
-            x = s;
+            *target = s;
             return false;
         }
 
-        template <typename T>
-            requires is_parseable_container_v<T>
-        expected<bool> builtin_parse(std::string_view s, T& x)
+        template <parseable_container T>
+        expected<bool> builtin_parse_container(std::string_view s, T* target)
         {
+            if(s.data() == nullptr)
+                return false;
+
             typename T::value_type v;
-            auto result = builtin_parse(s, v);
+            auto result = builtin_parse(s, &v);
             if(!result)
                 return result;
-            x.push_back(std::move(v));
+            target->push_back(std::move(v));
+
             return true;
         }
 
+        struct parse_visitor_t
+        {
+            parse_visitor_t() = default;
+            parse_visitor_t(std::string_view token) : token{token} {}
+            parse_visitor_t(const parse_visitor_t&) = default;
+
+            auto operator()(auto* target) const
+            {
+                return detail::builtin_parse(token, target);
+            }
+
+            auto operator()(
+                std::function<expected<bool>(std::string_view)>& fn) const
+            {
+                return fn(token);
+            }
+
+            std::string_view token;
+        };
     } // namespace detail
 
     struct flag_name_t
@@ -158,33 +180,40 @@ namespace cozy
 
     template <typename T>
     concept builtin_parseable =
-        detail::is_single_parseable_v<T> || detail::is_parseable_container_v<T>;
+        detail::single_parseable<T> || detail::parseable_container<T>;
 
     struct parse_arg_t
     {
         using result_t = expected<bool>;
-        auto operator()(std::string_view s)
+        auto operator()(std::string_view token)
         {
-            return std::visit(
-                [s](auto p) { return detail::builtin_parse(s, *p); }, target);
+            return std::visit(detail::parse_visitor_t{token}, target);
         }
 
-        using builtin_t =
-            std::variant<bool*, char*, unsigned char*, signed char*, short*,
-                         unsigned short*, int*, unsigned int*, long*,
-                         unsigned long*, long long*, unsigned long long*,
-                         float*, double*, long double*, std::string*,
-                         std::string_view*>;
+        using parseable_t = std::variant<
+            bool*, char*, unsigned char*, signed char*, short*, unsigned short*,
+            int*, unsigned int*, long*, unsigned long*, long long*,
+            unsigned long long*, float*, double*, long double*, std::string*,
+            std::string_view*, std::function<result_t(std::string_view)>>;
 
-        builtin_t target;
-        bool allow_empty = false;
+        parseable_t target;
+        bool variable_length = false;
     };
 
-    template <builtin_parseable T>
+    template <detail::single_parseable T>
     inline parse_arg_t make_parse_arg(T& target)
     {
         return parse_arg_t{.target = &target,
-                           .allow_empty = std::is_same_v<T, bool>};
+                           .variable_length = std::is_same_v<T, bool>};
+    }
+
+    template <detail::parseable_container T>
+    inline parse_arg_t make_parse_arg(T& target)
+    {
+        return parse_arg_t{
+            .target = [&target](std::string_view token)
+            { return detail::builtin_parse_container(token, &target); },
+            .variable_length = true};
     }
 
     class parser_t
@@ -217,11 +246,11 @@ namespace cozy
                 {
                     if(parse_arg)
                     {
-                        if(!parse_arg->allow_empty)
+                        if(!parse_arg->variable_length)
                             return std::unexpected{
                                 std::format("missing value after {}",
                                             std::string_view{args[i - 1]})};
-                        auto result = (*parse_arg)(""sv);
+                        auto result = (*parse_arg)({});
                         if(!result)
                             return std::unexpected{result.error()};
                         parse_arg = nullptr;
@@ -280,11 +309,11 @@ namespace cozy
 
             if(parse_arg)
             {
-                if(!parse_arg->allow_empty)
+                if(!parse_arg->variable_length)
                     return std::unexpected{
                         std::format("missing value after {}",
                                     std::string_view{args.back()})};
-                auto result = (*parse_arg)(""sv);
+                auto result = (*parse_arg)({});
                 if(!result)
                     return std::unexpected{result.error()};
             }
