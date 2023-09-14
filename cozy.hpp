@@ -26,15 +26,6 @@ namespace cozy
     template <typename T>
     using expected = std::expected<T, std::string>;
 
-    struct parse_arg_t
-    {
-        using result_t = expected<bool>;
-        auto operator()(std::string_view s) { return fn(s); }
-
-        std::function<result_t(std::string_view)> fn;
-        int allow_empty = false;
-    };
-
     namespace detail
     {
         inline constexpr bool invalid_name(std::string_view name)
@@ -56,6 +47,7 @@ namespace cozy
         template <typename T>
         inline constexpr bool is_parseable_container_v = requires(T x) {
             typename T::value_type;
+            requires !is_in<T, std::string, std::string_view>;
             requires is_single_parseable_v<typename T::value_type>;
             requires std::is_default_constructible_v<typename T::value_type>;
             {
@@ -89,21 +81,22 @@ namespace cozy
                                                    typestring::name<T>)};
             return false;
 #else
-            try
-            {
-                if constexpr(std::is_same_v<double, T>)
-                    x = stod(std::string(s));
-                else if constexpr(std::is_same_v<float, T>)
-                    x = stof(std::string(s));
-                else
-                    x = stold(std::string(s));
-                return false;
-            }
-            catch(...)
-            {
+            T tmp;
+            std::string str{s};
+            char* str_end;
+
+            if constexpr(std::is_same_v<double, T>)
+                tmp = std::strtod(str.c_str(), &str_end);
+            else if constexpr(std::is_same_v<float, T>)
+                tmp = std::strtof(str.c_str(), &str_end);
+            else
+                tmp = std::strtold(str.c_str(), &str_end);
+
+            if(str_end == str.c_str() || (str_end - str.c_str()) != s.size())
                 return std::unexpected{std::format("cannot parse {} as {}", s,
                                                    typestring::name<T>)};
-            }
+            x = tmp;
+            return false;
 #endif
         }
 
@@ -143,16 +136,21 @@ namespace cozy
 
     struct flag_name_t
     {
-        template <size_t N>
-        consteval flag_name_t(const char (&name)[N])
-            : flag_name_t{std::string_view{name}}
-        {
-        }
-
-        consteval flag_name_t(std::string_view name) : str{name}
+        template <std::convertible_to<std::string_view> T>
+        consteval flag_name_t(const T& name) : str{name}
         {
             if(detail::invalid_name(name))
                 throw std::runtime_error("invalid flag name");
+        }
+
+        std::string_view str;
+    };
+
+    struct help_str_t
+    {
+        template <std::convertible_to<std::string_view> T>
+        consteval help_str_t(const T& str) : str{str}
+        {
         }
 
         std::string_view str;
@@ -162,21 +160,48 @@ namespace cozy
     concept builtin_parseable =
         detail::is_single_parseable_v<T> || detail::is_parseable_container_v<T>;
 
+    struct parse_arg_t
+    {
+        using result_t = expected<bool>;
+        auto operator()(std::string_view s)
+        {
+            return std::visit(
+                [s](auto p) { return detail::builtin_parse(s, *p); }, target);
+        }
+
+        using builtin_t =
+            std::variant<bool*, char*, unsigned char*, signed char*, short*,
+                         unsigned short*, int*, unsigned int*, long*,
+                         unsigned long*, long long*, unsigned long long*,
+                         float*, double*, long double*, std::string*,
+                         std::string_view*>;
+
+        builtin_t target;
+        bool allow_empty = false;
+    };
+
     template <builtin_parseable T>
     inline parse_arg_t make_parse_arg(T& target)
     {
-        auto fn = [&target](std::string_view s)
-        { return detail::builtin_parse(s, target); };
-        return parse_arg_t{.fn = fn, .allow_empty = std::is_same_v<T, bool>};
+        return parse_arg_t{.target = &target,
+                           .allow_empty = std::is_same_v<T, bool>};
     }
 
     class parser_t
     {
+
+        struct flag_info_t
+        {
+            std::string_view name, help;
+            parse_arg_t parse_arg;
+        };
+
         static constexpr std::string_view plain_args_key = "";
 
       public:
         template <std::convertible_to<std::string_view> String>
-        expected<std::vector<std::string_view>> parse(std::span<String> args)
+        expected<std::vector<std::string_view>> parse(std::span<String> args,
+                                                      bool err_unknown = true)
         {
             program_name = args[0];
             args = args.subspan(1);
@@ -187,8 +212,8 @@ namespace cozy
             int i = 0;
             for(; i < args.size(); i++)
             {
-                std::string_view arg = args[i];
-                if(arg.starts_with('-'))
+                std::string_view token = args[i];
+                if(token.starts_with('-') && token.size() > 1)
                 {
                     if(parse_arg)
                     {
@@ -202,23 +227,46 @@ namespace cozy
                         parse_arg = nullptr;
                     }
 
-                    if(arg == "--")
+                    if(token == "--")
                     {
                         i++;
                         break;
                     }
 
-                    auto it = parse_args.find(arg);
-                    if(it == parse_args.end())
+                    std::string_view equal_token;
+                    auto pos = token.find('=');
+                    if(pos != token.npos)
                     {
-                        remaining.push_back(arg);
+                        equal_token = token.substr(pos + 1);
+                        token = token.substr(0, pos);
+                    }
+
+                    auto it = std::find_if(flag_info.begin(), flag_info.end(),
+                                           [token](auto& x)
+                                           { return x.name == token; });
+                    if(it == flag_info.end() || it->name != token)
+                    {
+                        if(err_unknown)
+                            return std::unexpected{
+                                std::format("unknown flag {}", token)};
+
+                        remaining.push_back(token);
                         continue;
                     }
-                    parse_arg = &it->second;
+                    parse_arg = &it->parse_arg;
+
+                    if(equal_token.data() == nullptr)
+                        continue;
+
+                    auto result = (*parse_arg)(equal_token);
+                    if(!result)
+                        return std::unexpected{result.error()};
+                    if(!result.value())
+                        parse_arg = nullptr;
                 }
                 else if(parse_arg)
                 {
-                    auto result = (*parse_arg)(arg);
+                    auto result = (*parse_arg)(token);
                     if(!result)
                         return std::unexpected{result.error()};
                     if(!result.value())
@@ -226,7 +274,7 @@ namespace cozy
                 }
                 else
                 {
-                    remaining.push_back(arg);
+                    remaining.push_back(token);
                 }
             }
 
@@ -247,10 +295,10 @@ namespace cozy
             return remaining;
         }
 
-        void flag(flag_name_t name, std::string_view help,
+        void flag(flag_name_t name, help_str_t help,
                   builtin_parseable auto& target)
         {
-            unguarded_vflag(name.str, help, make_parse_arg(target));
+            unguarded_vflag(name.str, help.str, make_parse_arg(target));
         }
 
         void vflag(std::string_view name, std::string_view help,
@@ -271,11 +319,21 @@ namespace cozy
             else
                 os << std::format("Usage:\n");
 
-            int longest =
-                max(help_strs |
-                    views::transform([](auto& hs) { return hs.first.size(); }));
-            for(auto [name, help] : help_strs)
-                os << std::format("    {:{}}{}\n", name, longest + 4, help);
+            auto name_len = [](auto& x) { return x.name.size(); };
+            int longest = max(flag_info | views::transform(name_len));
+            std::string indent(' ', longest + 8);
+
+            for(auto& [name, help, _] : flag_info)
+            {
+                os << std::format("    {:>{}}  ", name, longest);
+                for(auto c : help)
+                {
+                    os << c;
+                    if(c == '\n')
+                        os << indent;
+                }
+                os << '\n';
+            }
         }
 
         std::string usage() const
@@ -286,22 +344,14 @@ namespace cozy
         }
 
       private:
-        std::unordered_map<std::string_view, parse_arg_t> parse_args;
-        std::vector<std::pair<std::string_view, std::string_view>> help_strs;
+        std::vector<flag_info_t> flag_info;
         std::string_view program_name;
 
         void unguarded_vflag(std::string_view name, std::string_view help,
                              parse_arg_t parse_arg)
         {
-            if(parse_args.contains(name))
-            {
-                throw std::runtime_error{
-                    std::format("flag {} already exists", name)};
-            }
-
-            parse_args[name] = parse_arg;
-            help_strs.push_back({name, help});
+            flag_info.push_back(
+                {.name = name, .help = help, .parse_arg = parse_arg});
         }
     };
-
 } // namespace cozy
