@@ -184,6 +184,13 @@ namespace cozy
 
     struct parse_arg_t
     {
+        enum flag_type_t
+        {
+            single,
+            boolean,
+            variable,
+        };
+
         using result_t = expected<bool>;
         auto operator()(std::string_view token)
         {
@@ -197,14 +204,15 @@ namespace cozy
             std::string_view*, std::function<result_t(std::string_view)>>;
 
         parseable_t target;
-        bool variable_length = false;
+        flag_type_t flag_type = single;
     };
 
     template <detail::single_parseable T>
     inline parse_arg_t make_parse_arg(T& target)
     {
-        return parse_arg_t{.target = &target,
-                           .variable_length = std::is_same_v<T, bool>};
+        auto flag_type = std::is_same_v<T, bool> ? parse_arg_t::boolean
+                                                 : parse_arg_t::single;
+        return parse_arg_t{.target = &target, .flag_type = flag_type};
     }
 
     template <detail::parseable_container T>
@@ -213,7 +221,7 @@ namespace cozy
         return parse_arg_t{
             .target = [&target](std::string_view token)
             { return detail::builtin_parse_container(token, &target); },
-            .variable_length = true};
+            .flag_type = parse_arg_t::variable};
     }
 
     class parser_t
@@ -237,8 +245,26 @@ namespace cozy
 
             std::vector<std::string_view> remaining;
             parse_arg_t* parse_arg = nullptr;
-
             int i = 0;
+            auto end_of_argument = [&parse_arg, &args, &i]
+            {
+                switch(parse_arg->flag_type)
+                {
+                case parse_arg_t::single:
+                    return std::unexpected{
+                        std::format("missing value after {}",
+                                    std::string_view{args[i - 1]})};
+                case parse_arg_t::boolean: __builtin_unreachable();
+                case parse_arg_t::variable:
+                {
+                    auto result = (*parse_arg)({});
+                    if(!result)
+                        return std::unexpected{result.error()};
+                }
+                default: __builtin_unreachable();
+                }
+            };
+
             for(; i < args.size(); i++)
             {
                 std::string_view token = args[i];
@@ -246,13 +272,7 @@ namespace cozy
                 {
                     if(parse_arg)
                     {
-                        if(!parse_arg->variable_length)
-                            return std::unexpected{
-                                std::format("missing value after {}",
-                                            std::string_view{args[i - 1]})};
-                        auto result = (*parse_arg)({});
-                        if(!result)
-                            return std::unexpected{result.error()};
+                        end_of_argument();
                         parse_arg = nullptr;
                     }
 
@@ -285,7 +305,16 @@ namespace cozy
                     parse_arg = &it->parse_arg;
 
                     if(equal_token.data() == nullptr)
+                    {
+                        if(parse_arg->flag_type == parse_arg_t::boolean)
+                        {
+                            auto result = (*parse_arg)({});
+                            if(!result)
+                                return std::unexpected{result.error()};
+                            parse_arg = nullptr;
+                        }
                         continue;
+                    }
 
                     auto result = (*parse_arg)(equal_token);
                     if(!result)
@@ -308,15 +337,7 @@ namespace cozy
             }
 
             if(parse_arg)
-            {
-                if(!parse_arg->variable_length)
-                    return std::unexpected{
-                        std::format("missing value after {}",
-                                    std::string_view{args.back()})};
-                auto result = (*parse_arg)({});
-                if(!result)
-                    return std::unexpected{result.error()};
-            }
+                end_of_argument();
 
             for(; i < args.size(); i++)
                 remaining.push_back(args[i]);
