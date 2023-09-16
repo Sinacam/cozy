@@ -184,7 +184,7 @@ namespace cozy
 
     struct parse_arg_t
     {
-        enum flag_type_t
+        enum flag_kind_t
         {
             single,
             boolean,
@@ -204,15 +204,15 @@ namespace cozy
             std::string_view*, std::function<result_t(std::string_view)>>;
 
         parseable_t target;
-        flag_type_t flag_type = single;
+        flag_kind_t flag_kind = single;
     };
 
     template <detail::single_parseable T>
     inline parse_arg_t make_parse_arg(T& target)
     {
-        auto flag_type = std::is_same_v<T, bool> ? parse_arg_t::boolean
+        auto flag_kind = std::is_same_v<T, bool> ? parse_arg_t::boolean
                                                  : parse_arg_t::single;
-        return parse_arg_t{.target = &target, .flag_type = flag_type};
+        return parse_arg_t{.target = &target, .flag_kind = flag_kind};
     }
 
     template <detail::parseable_container T>
@@ -221,7 +221,7 @@ namespace cozy
         return parse_arg_t{
             .target = [&target](std::string_view token)
             { return detail::builtin_parse_container(token, &target); },
-            .flag_type = parse_arg_t::variable};
+            .flag_kind = parse_arg_t::variable};
     }
 
     class parser_t
@@ -248,7 +248,7 @@ namespace cozy
             int i = 0;
             auto end_of_argument = [&parse_arg, &args, &i]
             {
-                switch(parse_arg->flag_type)
+                switch(parse_arg->flag_kind)
                 {
                 case parse_arg_t::single:
                     return std::unexpected{
@@ -306,7 +306,7 @@ namespace cozy
 
                     if(equal_token.data() == nullptr)
                     {
-                        if(parse_arg->flag_type == parse_arg_t::boolean)
+                        if(parse_arg->flag_kind == parse_arg_t::boolean)
                         {
                             auto result = (*parse_arg)({});
                             if(!result)
