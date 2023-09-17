@@ -8,7 +8,6 @@
 #include <cstddef>
 #include <expected>
 #include <format>
-#include <functional>
 #include <limits>
 #include <ranges>
 #include <span>
@@ -135,6 +134,17 @@ namespace cozy
             return true;
         }
 
+        struct parse_handle_t
+        {
+            expected<bool> operator()(std::string_view token)
+            {
+                return call(token, target);
+            }
+
+            void* target;
+            expected<bool> (*call)(std::string_view, void*);
+        };
+
         struct parse_visitor_t
         {
             parse_visitor_t() = default;
@@ -146,10 +156,9 @@ namespace cozy
                 return detail::builtin_parse(token, target);
             }
 
-            auto operator()(
-                std::function<expected<bool>(std::string_view)>& fn) const
+            auto operator()(parse_handle_t handle) const
             {
-                return fn(token);
+                return handle(token);
             }
 
             std::string_view token;
@@ -197,31 +206,42 @@ namespace cozy
             return std::visit(detail::parse_visitor_t{token}, target);
         }
 
-        using parseable_t = std::variant<
-            bool*, char*, unsigned char*, signed char*, short*, unsigned short*,
-            int*, unsigned int*, long*, unsigned long*, long long*,
-            unsigned long long*, float*, double*, long double*, std::string*,
-            std::string_view*, std::function<result_t(std::string_view)>>;
+        flag_kind_t flag_kind() const
+        {
+            switch(target.index())
+            {
+            case 0: return boolean;
+            case 18: return variable;
+            default: return single;
+            }
+        }
+
+        using parseable_t =
+            std::variant<bool*, char*, unsigned char*, signed char*, short*,
+                         unsigned short*, int*, unsigned int*, long*,
+                         unsigned long*, long long*, unsigned long long*,
+                         float*, double*, long double*, std::string*,
+                         std::string_view*, detail::parse_handle_t>;
+        // TODO: differentiate user vs built-in function for flag_kind
 
         parseable_t target;
-        flag_kind_t flag_kind = single;
     };
 
     template <detail::single_parseable T>
     inline parse_arg_t make_parse_arg(T& target)
     {
-        auto flag_kind = std::is_same_v<T, bool> ? parse_arg_t::boolean
-                                                 : parse_arg_t::single;
-        return parse_arg_t{.target = &target, .flag_kind = flag_kind};
+        return parse_arg_t{.target = &target};
     }
 
     template <detail::parseable_container T>
     inline parse_arg_t make_parse_arg(T& target)
     {
-        return parse_arg_t{
-            .target = [&target](std::string_view token)
-            { return detail::builtin_parse_container(token, &target); },
-            .flag_kind = parse_arg_t::variable};
+        auto call = [](std::string_view token, void* target) {
+            return detail::builtin_parse_container(token,
+                                                   static_cast<T*>(target));
+        };
+        auto handle = detail::parse_handle_t{.target = &target, .call = call};
+        return {.target = handle};
     }
 
     class parser_t
@@ -248,7 +268,7 @@ namespace cozy
             int i = 0;
             auto end_of_argument = [&parse_arg, &args, &i]
             {
-                switch(parse_arg->flag_kind)
+                switch(parse_arg->flag_kind())
                 {
                 case parse_arg_t::single:
                     return std::unexpected{
@@ -306,7 +326,7 @@ namespace cozy
 
                     if(equal_token.data() == nullptr)
                     {
-                        if(parse_arg->flag_kind == parse_arg_t::boolean)
+                        if(parse_arg->flag_kind() == parse_arg_t::boolean)
                         {
                             auto result = (*parse_arg)({});
                             if(!result)
