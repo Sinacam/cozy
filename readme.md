@@ -63,11 +63,3 @@ Use `--` to delimit end of flags
 ```bash
 ./program -n 420 -- -n not a flag anymore
 ```
-
-If unknown flags should be passed on to remaining arguments, call
-```c++
-parser.parse(std::span{argv, argv + argc}, true);
-// calling the program by
-//  ./program -a
-// will result in (*remaining)[0] == "-a"
-```
