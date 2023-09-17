@@ -15,7 +15,6 @@
 #include <stdexcept>
 #include <string_view>
 #include <type_traits>
-#include <unordered_map>
 #include <vector>
 
 namespace cozy
@@ -136,6 +135,8 @@ namespace cozy
 
         struct parse_handle_t
         {
+            // parse_handle_t exists because std::function is 64 bytes
+            // as opposed to 16 bytes
             expected<bool> operator()(std::string_view token)
             {
                 return call(token, target);
@@ -163,6 +164,64 @@ namespace cozy
 
             std::string_view token;
         };
+
+        enum class token_kind_t
+        {
+            literal,
+            arg,
+            flag,
+        };
+
+        template <std::convertible_to<std::string_view> String>
+        inline auto semantic_tokenize(std::span<String> args)
+        {
+            auto ret = std::pair{std::vector<std::string_view>{},
+                                 std::vector<token_kind_t>{}};
+            auto& [tokens, kinds] = ret;
+
+            for(size_t i = 0; i < args.size(); i++)
+            {
+                std::string_view token = args[i];
+                if(!token.starts_with('-') || token.size() < 2)
+                {
+                    tokens.push_back(token);
+                    kinds.push_back(token_kind_t::literal);
+                    continue;
+                }
+
+                if(token == "--"sv)
+                {
+                    tokens.insert(tokens.end(), args.begin() + i + 1,
+                                  args.end());
+                    kinds.insert(kinds.end(), args.size() - i - 1,
+                                 token_kind_t::literal);
+                    return ret;
+                }
+
+                auto equal_pos = token.find('=');
+                if(token[1] == '-')
+                {
+                    tokens.push_back(token.substr(2, equal_pos - 2));
+                    kinds.push_back(token_kind_t::flag);
+                }
+                else
+                {
+                    auto end = std::min(equal_pos, token.size());
+                    for(size_t j = 1; j < end; j++)
+                    {
+                        tokens.push_back(token.substr(j, 1));
+                        kinds.push_back(token_kind_t::flag);
+                    }
+                }
+
+                if(equal_pos != token.npos)
+                {
+                    tokens.push_back(token.substr(equal_pos + 1));
+                    kinds.push_back(token_kind_t::arg);
+                }
+            }
+            return ret;
+        }
     } // namespace detail
 
     struct flag_name_t
@@ -200,20 +259,9 @@ namespace cozy
             variable,
         };
 
-        using result_t = expected<bool>;
         auto operator()(std::string_view token)
         {
             return std::visit(detail::parse_visitor_t{token}, target);
-        }
-
-        flag_kind_t flag_kind() const
-        {
-            switch(target.index())
-            {
-            case 0: return boolean;
-            case 18: return variable;
-            default: return single;
-            }
         }
 
         using parseable_t =
@@ -223,6 +271,16 @@ namespace cozy
                          float*, double*, long double*, std::string*,
                          std::string_view*, detail::parse_handle_t>;
         // TODO: differentiate user vs built-in function for flag_kind
+
+        flag_kind_t kind() const
+        {
+            switch(target.index())
+            {
+            case 0: return boolean;
+            case std::variant_size_v<parseable_t> - 1: return variable;
+            default: return single;
+            }
+        }
 
         parseable_t target;
     };
@@ -253,114 +311,126 @@ namespace cozy
             parse_arg_t parse_arg;
         };
 
-        static constexpr std::string_view plain_args_key = "";
-
       public:
         template <std::convertible_to<std::string_view> String>
         expected<std::vector<std::string_view>> parse(std::span<String> args,
                                                       bool err_unknown = true)
         {
-            program_name = args[0];
+            if(args.empty())
+                return {};
+
+            command_name = args[0];
             args = args.subspan(1);
+
+            using detail::token_kind_t;
+            auto [tokens, kinds] = detail::semantic_tokenize(args);
 
             std::vector<std::string_view> remaining;
             parse_arg_t* parse_arg = nullptr;
-            int i = 0;
-            auto end_of_argument = [&parse_arg, &args, &i]
+            auto tb = tokens.begin();
+            auto kb = kinds.begin(), ke = kinds.end();
+
+            auto end_of_flag = [](auto& parse_arg, auto& tb) -> expected<void>
             {
-                switch(parse_arg->flag_kind())
+                if(parse_arg->kind() == parse_arg_t::single)
                 {
-                case parse_arg_t::single:
-                    return std::unexpected{
-                        std::format("missing value after {}",
-                                    std::string_view{args[i - 1]})};
-                case parse_arg_t::boolean: __builtin_unreachable();
-                case parse_arg_t::variable:
-                {
-                    auto result = (*parse_arg)({});
-                    if(!result)
-                        return std::unexpected{result.error()};
-                }
-                default: __builtin_unreachable();
-                }
-            };
-
-            for(; i < args.size(); i++)
-            {
-                std::string_view token = args[i];
-                if(token.starts_with('-') && token.size() > 1)
-                {
-                    if(parse_arg)
-                    {
-                        end_of_argument();
-                        parse_arg = nullptr;
-                    }
-
-                    if(token == "--")
-                    {
-                        i++;
-                        break;
-                    }
-
-                    std::string_view equal_token;
-                    auto pos = token.find('=');
-                    if(pos != token.npos)
-                    {
-                        equal_token = token.substr(pos + 1);
-                        token = token.substr(0, pos);
-                    }
-
-                    auto it = std::find_if(flag_info.begin(), flag_info.end(),
-                                           [token](auto& x)
-                                           { return x.name == token; });
-                    if(it == flag_info.end() || it->name != token)
-                    {
-                        if(err_unknown)
-                            return std::unexpected{
-                                std::format("unknown flag {}", token)};
-
-                        remaining.push_back(token);
-                        continue;
-                    }
-                    parse_arg = &it->parse_arg;
-
-                    if(equal_token.data() == nullptr)
-                    {
-                        if(parse_arg->flag_kind() == parse_arg_t::boolean)
-                        {
-                            auto result = (*parse_arg)({});
-                            if(!result)
-                                return std::unexpected{result.error()};
-                            parse_arg = nullptr;
-                        }
-                        continue;
-                    }
-
-                    auto result = (*parse_arg)(equal_token);
-                    if(!result)
-                        return std::unexpected{result.error()};
-                    if(!result.value())
-                        parse_arg = nullptr;
-                }
-                else if(parse_arg)
-                {
-                    auto result = (*parse_arg)(token);
-                    if(!result)
-                        return std::unexpected{result.error()};
-                    if(!result.value())
-                        parse_arg = nullptr;
+                    auto prevtoken = tb[-1];
+                    auto dashes = prevtoken.size() > 1 ? "--"sv : "-"sv;
+                    return std::unexpected{std::format(
+                        "missing value after {}{}", dashes, prevtoken)};
                 }
                 else
                 {
-                    remaining.push_back(token);
+                    auto result = (*parse_arg)({});
+                    if(!result)
+                        return std::unexpected{std::move(result.error())};
+                    // postcondition: !result.value()
+                    parse_arg = nullptr;
+                }
+                return {};
+            };
+
+            for(; kb != ke; kb++)
+            {
+                switch(*kb)
+                {
+                case token_kind_t::literal:
+                {
+                    if(!parse_arg)
+                    {
+                        remaining.push_back(*tb);
+                    }
+                    else if(parse_arg->kind() == parse_arg_t::boolean)
+                    {
+                        (void)(*parse_arg)({});
+                        parse_arg = nullptr;
+                        remaining.push_back(*tb);
+                    }
+                    else
+                    {
+                        auto result = (*parse_arg)(*tb);
+                        if(!result)
+                            return std::unexpected{std::move(result.error())};
+                        if(!result.value())
+                            parse_arg = nullptr;
+                    }
+
+                    tb++;
+                    break;
+                }
+                case token_kind_t::arg:
+                {
+                    // precondition: parse_arg != nullptr
+                    auto result = (*parse_arg)(*tb);
+                    if(!result)
+                        return std::unexpected{std::move(result.error())};
+                    if(!result.value())
+                        parse_arg = nullptr;
+
+                    tb++;
+                    break;
+                }
+                case token_kind_t::flag:
+                {
+                    if(parse_arg)
+                    {
+                        auto result = end_of_flag(parse_arg, tb);
+                        if(!result)
+                            return std::unexpected{result.error()};
+                    }
+
+                    auto token = *tb;
+                    auto it = std::find_if(flag_info.begin(), flag_info.end(),
+                                           [token](auto& x)
+                                           { return x.name == token; });
+                    if(it == flag_info.end())
+                    {
+                        if(err_unknown)
+                        {
+                            auto dashes = token.size() > 1 ? "--"sv : "-"sv;
+                            return std::unexpected{std::format(
+                                "unknown flag {}{}", dashes, token)};
+                        }
+
+                        remaining.push_back(token);
+                    }
+                    else
+                    {
+                        parse_arg = &it->parse_arg;
+                    }
+
+                    tb++;
+                    break;
+                }
                 }
             }
 
             if(parse_arg)
-                end_of_argument();
-
-            for(; i < args.size(); i++)
-                remaining.push_back(args[i]);
+            {
+                auto result = end_of_flag(parse_arg, tb);
+                if(!result)
+                    return std::unexpected{result.error()};
+            }
 
             return remaining;
         }
@@ -384,8 +454,8 @@ namespace cozy
         {
             using namespace std::ranges;
 
-            if(program_name.size() > 0)
-                os << std::format("Usage of {}:\n", program_name);
+            if(command_name.size() > 0)
+                os << std::format("Usage of {}:\n", command_name);
             else
                 os << std::format("Usage:\n");
 
@@ -414,12 +484,21 @@ namespace cozy
         }
 
       private:
+        // TODO: rewrite flag_info into four vectors:
+        //  (name, help, parse_arg, index)
+        // index is the original order, as opposed to the sorted order
         std::vector<flag_info_t> flag_info;
-        std::string_view program_name;
+        std::string_view command_name;
 
         void unguarded_vflag(std::string_view name, std::string_view help,
                              parse_arg_t parse_arg)
         {
+            // precondition: name.size() > 1
+            if(name[1] == '-')
+                name = name.substr(2);
+            else
+                name = name.substr(1);
+
             flag_info.push_back(
                 {.name = name, .help = help, .parse_arg = parse_arg});
         }
