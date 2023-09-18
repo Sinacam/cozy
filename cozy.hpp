@@ -269,7 +269,8 @@ namespace cozy
                          unsigned long*, long long*, unsigned long long*,
                          float*, double*, long double*, std::string*,
                          std::string_view*, detail::parse_handle_t>;
-        // TODO: differentiate user vs built-in function for flag_kind
+        // TODO: differentiate user vs built-in function for flag_kind for user
+        // extensions
 
         flag_kind_t kind() const
         {
@@ -303,222 +304,267 @@ namespace cozy
 
     class parser_t
     {
+      public:
+        // Parses a span of arguments.
+        // Typically, you pass std::span{argv + 1, argv + argc} from main.
+        // Returns the remaining arguments that aren't part of flags.
+        template <std::convertible_to<std::string_view> String>
+        [[nodiscard]] expected<std::vector<std::string_view>>
+        parse(std::span<String> args);
 
+        // Adds a flag to the parser, with constexpr name and help.
+        // target can be a basic type, std::string, std::string_view or a
+        // container of them.
+        // target must be kept alive throught the lifetime of parser_t.
+        // Equivalent to vflag(name, help, make_parse_arg(target))
+        void flag(flag_name_t name, help_str_t help,
+                  builtin_parseable auto& target);
+
+        // Same as flag except name and help can be runtime values.
+        // parse_arg is constructed by calling make_parse_arg(target).
+        // The string that name and help refers to must be kept alive thoughout
+        // the lifetime of parser_t.
+        void vflag(std::string_view name, std::string_view help,
+                   parse_arg_t parse_arg);
+
+        // Writes the options string to it.
+        // The length of the string can be computed by options_len.
+        template <std::output_iterator<char> It>
+        auto options_to(It it) const -> It;
+
+        // Returns the options string.
+        [[nodiscard]] std::string options() const;
+
+        // Computes the length of the options string.
+        // help_newlines is the number of '\n' in help strings.
+        [[nodiscard]] size_t options_len(int help_newlines = 0) const;
+
+      private:
         struct flag_info_t
         {
             std::string_view name, help;
             parse_arg_t parse_arg;
         };
-
-      public:
-        template <std::convertible_to<std::string_view> String>
-        expected<std::vector<std::string_view>> parse(std::span<String> args,
-                                                      bool err_unknown = true)
-        {
-            using detail::token_kind_t;
-            auto [tokens, kinds] = detail::semantic_tokenize(args);
-
-            std::vector<std::string_view> remaining;
-            parse_arg_t* parse_arg = nullptr;
-            auto tb = tokens.begin();
-            auto kb = kinds.begin(), ke = kinds.end();
-
-            auto end_of_flag = [](auto& parse_arg, auto& tb) -> expected<void>
-            {
-                if(parse_arg->kind() == parse_arg_t::single)
-                {
-                    auto prevtoken = tb[-1];
-                    auto dashes = prevtoken.size() > 1 ? "--"sv : "-"sv;
-                    return std::unexpected{std::format(
-                        "missing value after {}{}", dashes, prevtoken)};
-                }
-                else
-                {
-                    auto result = (*parse_arg)({});
-                    if(!result)
-                        return std::unexpected{std::move(result.error())};
-                    // postcondition: !result.value()
-                    parse_arg = nullptr;
-                }
-                return {};
-            };
-
-            for(; kb != ke; kb++)
-            {
-                switch(*kb)
-                {
-                case token_kind_t::literal:
-                {
-                    if(!parse_arg)
-                    {
-                        remaining.push_back(*tb);
-                    }
-                    else if(parse_arg->kind() == parse_arg_t::boolean)
-                    {
-                        (void)(*parse_arg)({});
-                        parse_arg = nullptr;
-                        remaining.push_back(*tb);
-                    }
-                    else
-                    {
-                        auto result = (*parse_arg)(*tb);
-                        if(!result)
-                            return std::unexpected{std::move(result.error())};
-                        if(!result.value())
-                            parse_arg = nullptr;
-                    }
-
-                    tb++;
-                    break;
-                }
-                case token_kind_t::arg:
-                {
-                    // precondition: parse_arg != nullptr
-                    auto result = (*parse_arg)(*tb);
-                    if(!result)
-                        return std::unexpected{std::move(result.error())};
-                    if(!result.value())
-                        parse_arg = nullptr;
-
-                    tb++;
-                    break;
-                }
-                case token_kind_t::flag:
-                {
-                    if(parse_arg)
-                    {
-                        auto result = end_of_flag(parse_arg, tb);
-                        if(!result)
-                            return std::unexpected{result.error()};
-                    }
-
-                    auto token = *tb;
-                    auto it = std::find_if(flag_info.begin(), flag_info.end(),
-                                           [token](auto& x)
-                                           { return x.name == token; });
-                    if(it == flag_info.end())
-                    {
-                        if(err_unknown)
-                        {
-                            auto dashes = token.size() > 1 ? "--"sv : "-"sv;
-                            return std::unexpected{std::format(
-                                "unknown flag {}{}", dashes, token)};
-                        }
-
-                        remaining.push_back(token);
-                    }
-                    else
-                    {
-                        parse_arg = &it->parse_arg;
-                    }
-
-                    tb++;
-                    break;
-                }
-                }
-            }
-
-            if(parse_arg)
-            {
-                auto result = end_of_flag(parse_arg, tb);
-                if(!result)
-                    return std::unexpected{result.error()};
-            }
-
-            return remaining;
-        }
-
-        void flag(flag_name_t name, help_str_t help,
-                  builtin_parseable auto& target)
-        {
-            unguarded_vflag(name.str, help.str, make_parse_arg(target));
-        }
-
-        void vflag(std::string_view name, std::string_view help,
-                   parse_arg_t parse_arg)
-        {
-            if(detail::invalid_name(name))
-                throw std::runtime_error{
-                    std::format("invalid flag name {}", name)};
-            unguarded_vflag(name, help, parse_arg);
-        }
-
-        auto options_to(std::output_iterator<char> auto it) const
-        {
-            using namespace std::ranges;
-
-            size_t longest = max(flag_info | views::transform(flag_len));
-            std::string indent(longest + 6, ' ');
-
-            for(auto& [name, help, _] : flag_info)
-            {
-                auto dashes = name.size() > 1 ? "--"sv : "-"sv;
-                it = std::format_to(it, "    {:>{}}{}  ", dashes,
-                                    longest - dashed_len(name) + 1, name);
-
-                for(auto c : help)
-                {
-                    *it++ = c;
-                    if(c == '\n')
-                        it = std::copy(indent.begin(), indent.end(), it);
-                }
-                *it++ = '\n';
-            }
-            return it;
-        }
-
-        std::string options() const
-        {
-            std::string buf;
-            buf.reserve(options_len());
-
-            options_to(std::back_inserter(buf));
-            return buf;
-        }
-
-        size_t options_len(int help_newlines = 0) const
-        {
-            using namespace std::ranges;
-            size_t longest = max(flag_info | views::transform(flag_len));
-
-            // approximate due to newline in help requiring indentation
-            auto approx_help_lens =
-                flag_info |
-                views::transform([](auto& x) { return x.help.size(); });
-            size_t approx_sum = std::accumulate(approx_help_lens.begin(),
-                                                approx_help_lens.end(), 0);
-
-            // +7 because 6 spaces and 1 newline, keep in sync with options_to
-            return approx_sum +
-                   (longest + 7) * (flag_info.size() + help_newlines);
-        }
-
-      private:
         // TODO: rewrite flag_info into four vectors:
         //  (name, help, parse_arg, index)
         // index is the original order, as opposed to the sorted order
         std::vector<flag_info_t> flag_info;
 
         void unguarded_vflag(std::string_view name, std::string_view help,
-                             parse_arg_t parse_arg)
-        {
-            // precondition: name.size() > 1
-            if(name[1] == '-')
-                name = name.substr(2);
-            else
-                name = name.substr(1);
+                             parse_arg_t parse_arg);
 
-            flag_info.push_back(
-                {.name = name, .help = help, .parse_arg = parse_arg});
-        }
-
-        static size_t dashed_len(std::string_view name)
-        {
-            return name.size() + 1 + (name.size() > 1);
-        }
-        static size_t flag_len(const flag_info_t& x)
-        {
-            return dashed_len(x.name);
-        };
+        static size_t dashed_len(std::string_view name);
+        static size_t flag_len(const flag_info_t& x);
     };
+
+    template <std::convertible_to<std::string_view> String>
+    expected<std::vector<std::string_view>>
+    parser_t::parse(std::span<String> args)
+    {
+        // TODO: currently err_unknown = false is not implemented correctly
+        static constexpr bool err_unknown = true;
+
+        using detail::token_kind_t;
+        auto [tokens, kinds] = detail::semantic_tokenize(args);
+
+        std::vector<std::string_view> remaining;
+        parse_arg_t* parse_arg = nullptr;
+        auto tb = tokens.begin();
+        auto kb = kinds.begin(), ke = kinds.end();
+
+        auto end_of_flag = [](auto& parse_arg, auto& tb) -> expected<void>
+        {
+            if(parse_arg->kind() == parse_arg_t::single)
+            {
+                auto prevtoken = tb[-1];
+                auto dashes = prevtoken.size() > 1 ? "--"sv : "-"sv;
+                return std::unexpected{
+                    std::format("missing value after {}{}", dashes, prevtoken)};
+            }
+            else
+            {
+                auto result = (*parse_arg)({});
+                if(!result)
+                    return std::unexpected{std::move(result.error())};
+                // postcondition: !result.value()
+                parse_arg = nullptr;
+            }
+            return {};
+        };
+
+        for(; kb != ke; kb++)
+        {
+            switch(*kb)
+            {
+            case token_kind_t::literal:
+            {
+                if(!parse_arg)
+                {
+                    remaining.push_back(*tb);
+                }
+                else if(parse_arg->kind() == parse_arg_t::boolean)
+                {
+                    (void)(*parse_arg)({});
+                    parse_arg = nullptr;
+                    remaining.push_back(*tb);
+                }
+                else
+                {
+                    auto result = (*parse_arg)(*tb);
+                    if(!result)
+                        return std::unexpected{std::move(result.error())};
+                    if(!result.value())
+                        parse_arg = nullptr;
+                }
+
+                tb++;
+                break;
+            }
+            case token_kind_t::arg:
+            {
+                // precondition: parse_arg != nullptr
+                auto result = (*parse_arg)(*tb);
+                if(!result)
+                    return std::unexpected{std::move(result.error())};
+                if(!result.value())
+                    parse_arg = nullptr;
+
+                tb++;
+                break;
+            }
+            case token_kind_t::flag:
+            {
+                if(parse_arg)
+                {
+                    auto result = end_of_flag(parse_arg, tb);
+                    if(!result)
+                        return std::unexpected{result.error()};
+                }
+
+                auto token = *tb;
+                auto it =
+                    std::find_if(flag_info.begin(), flag_info.end(),
+                                 [token](auto& x) { return x.name == token; });
+                if(it == flag_info.end())
+                {
+                    if(err_unknown)
+                    {
+                        auto dashes = token.size() > 1 ? "--"sv : "-"sv;
+                        return std::unexpected{
+                            std::format("unknown flag {}{}", dashes, token)};
+                    }
+
+                    remaining.push_back(token);
+                }
+                else
+                {
+                    parse_arg = &it->parse_arg;
+                }
+
+                tb++;
+                break;
+            }
+            }
+        }
+
+        if(parse_arg)
+        {
+            auto result = end_of_flag(parse_arg, tb);
+            if(!result)
+                return std::unexpected{result.error()};
+        }
+
+        return remaining;
+    }
+
+    inline void parser_t::flag(flag_name_t name, help_str_t help,
+                               builtin_parseable auto& target)
+    {
+        unguarded_vflag(name.str, help.str, make_parse_arg(target));
+    }
+
+    inline void parser_t::vflag(std::string_view name, std::string_view help,
+                                parse_arg_t parse_arg)
+    {
+        if(detail::invalid_name(name))
+            throw std::runtime_error{std::format("invalid flag name {}", name)};
+        unguarded_vflag(name, help, parse_arg);
+    }
+
+    template <std::output_iterator<char> It>
+    auto parser_t::options_to(It it) const -> It
+    {
+        using namespace std::ranges;
+
+        size_t longest = max(flag_info | views::transform(flag_len));
+        std::string indent(longest + 6, ' ');
+
+        for(auto& [name, help, _] : flag_info)
+        {
+            auto dashes = name.size() > 1 ? "--"sv : "-"sv;
+            it = std::format_to(it, "    {:>{}}{}  ", dashes,
+                                longest - dashed_len(name) + 1, name);
+
+            for(auto c : help)
+            {
+                *it++ = c;
+                if(c == '\n')
+                    it = std::copy(indent.begin(), indent.end(), it);
+            }
+            *it++ = '\n';
+        }
+        return it;
+    }
+
+    inline std::string parser_t::options() const
+    {
+        std::string buf;
+        buf.reserve(options_len());
+
+        options_to(std::back_inserter(buf));
+        return buf;
+    }
+
+    inline size_t parser_t::options_len(int help_newlines) const
+    {
+        using namespace std::ranges;
+        size_t longest = max(flag_info | views::transform(flag_len));
+
+        // approximate due to newline in help requiring indentation
+        auto approx_help_lens =
+            flag_info | views::transform([](auto& x) { return x.help.size(); });
+        size_t approx_sum = std::accumulate(approx_help_lens.begin(),
+                                            approx_help_lens.end(), 0);
+
+        // Padding is longest + 6, each entry in flag_info also requires an
+        // extra newline.
+        // Keep in sync with options_to format.
+        return approx_sum + (longest + 6) * (flag_info.size() + help_newlines) +
+               flag_info.size();
+    }
+
+    inline void parser_t::unguarded_vflag(std::string_view name,
+                                          std::string_view help,
+                                          parse_arg_t parse_arg)
+    {
+        // precondition: name.size() > 1
+        if(name[1] == '-')
+            name = name.substr(2);
+        else
+            name = name.substr(1);
+
+        flag_info.push_back(
+            {.name = name, .help = help, .parse_arg = parse_arg});
+    }
+
+    inline size_t parser_t::dashed_len(std::string_view name)
+    {
+        return name.size() + 1 + (name.size() > 1);
+    }
+
+    inline size_t parser_t::flag_len(const flag_info_t& x)
+    {
+        return dashed_len(x.name);
+    };
+
 } // namespace cozy
