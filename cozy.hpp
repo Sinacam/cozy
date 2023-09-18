@@ -8,10 +8,9 @@
 #include <cstddef>
 #include <expected>
 #include <format>
-#include <limits>
+#include <numeric>
 #include <ranges>
 #include <span>
-#include <sstream>
 #include <stdexcept>
 #include <string_view>
 #include <type_traits>
@@ -444,38 +443,54 @@ namespace cozy
             unguarded_vflag(name, help, parse_arg);
         }
 
-        void options_to(std::ostream& os) const
+        auto options_to(std::output_iterator<char> auto it) const
         {
             using namespace std::ranges;
 
-            static constexpr auto dashed_len = [](auto name)
-            { return name.size() + 1 + (name.size() > 1); };
-            static constexpr auto flag_len = [](auto& x)
-            { return dashed_len(x.name); };
-
-            int longest = max(flag_info | views::transform(flag_len));
+            size_t longest = max(flag_info | views::transform(flag_len));
             std::string indent(longest + 6, ' ');
 
             for(auto& [name, help, _] : flag_info)
             {
                 auto dashes = name.size() > 1 ? "--"sv : "-"sv;
-                os << std::format("    {:>{}}{}  ", dashes,
-                                  longest - dashed_len(name) + 1, name);
+                it = std::format_to(it, "    {:>{}}{}  ", dashes,
+                                    longest - dashed_len(name) + 1, name);
+
                 for(auto c : help)
                 {
-                    os << c;
+                    *it++ = c;
                     if(c == '\n')
-                        os << indent;
+                        it = std::copy(indent.begin(), indent.end(), it);
                 }
-                os << '\n';
+                *it++ = '\n';
             }
+            return it;
         }
 
         std::string options() const
         {
-            std::stringstream ss;
-            options_to(ss);
-            return ss.str();
+            std::string buf;
+            buf.reserve(options_len());
+
+            options_to(std::back_inserter(buf));
+            return buf;
+        }
+
+        size_t options_len(int help_newlines = 0) const
+        {
+            using namespace std::ranges;
+            size_t longest = max(flag_info | views::transform(flag_len));
+
+            // approximate due to newline in help requiring indentation
+            auto approx_help_lens =
+                flag_info |
+                views::transform([](auto& x) { return x.help.size(); });
+            size_t approx_sum = std::accumulate(approx_help_lens.begin(),
+                                                approx_help_lens.end(), 0);
+
+            // +7 because 6 spaces and 1 newline, keep in sync with options_to
+            return approx_sum +
+                   (longest + 7) * (flag_info.size() + help_newlines);
         }
 
       private:
@@ -496,5 +511,14 @@ namespace cozy
             flag_info.push_back(
                 {.name = name, .help = help, .parse_arg = parse_arg});
         }
+
+        static size_t dashed_len(std::string_view name)
+        {
+            return name.size() + 1 + (name.size() > 1);
+        }
+        static size_t flag_len(const flag_info_t& x)
+        {
+            return dashed_len(x.name);
+        };
     };
 } // namespace cozy
