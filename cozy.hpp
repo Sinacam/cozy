@@ -316,12 +316,6 @@ namespace cozy
         expected<std::vector<std::string_view>> parse(std::span<String> args,
                                                       bool err_unknown = true)
         {
-            if(args.empty())
-                return {};
-
-            command_name = args[0];
-            args = args.subspan(1);
-
             using detail::token_kind_t;
             auto [tokens, kinds] = detail::semantic_tokenize(args);
 
@@ -450,22 +444,23 @@ namespace cozy
             unguarded_vflag(name, help, parse_arg);
         }
 
-        void usage_to(std::ostream& os) const
+        void options_to(std::ostream& os) const
         {
             using namespace std::ranges;
 
-            if(command_name.size() > 0)
-                os << std::format("Usage of {}:\n", command_name);
-            else
-                os << std::format("Usage:\n");
+            static constexpr auto dashed_len = [](auto name)
+            { return name.size() + 1 + (name.size() > 1); };
+            static constexpr auto flag_len = [](auto& x)
+            { return dashed_len(x.name); };
 
-            auto name_len = [](auto& x) { return x.name.size(); };
-            int longest = max(flag_info | views::transform(name_len));
-            std::string indent(' ', longest + 8);
+            int longest = max(flag_info | views::transform(flag_len));
+            std::string indent(longest + 6, ' ');
 
             for(auto& [name, help, _] : flag_info)
             {
-                os << std::format("    {:>{}}  ", name, longest);
+                auto dashes = name.size() > 1 ? "--"sv : "-"sv;
+                os << std::format("    {:>{}}{}  ", dashes,
+                                  longest - dashed_len(name) + 1, name);
                 for(auto c : help)
                 {
                     os << c;
@@ -476,10 +471,10 @@ namespace cozy
             }
         }
 
-        std::string usage() const
+        std::string options() const
         {
             std::stringstream ss;
-            usage_to(ss);
+            options_to(ss);
             return ss.str();
         }
 
@@ -488,7 +483,6 @@ namespace cozy
         //  (name, help, parse_arg, index)
         // index is the original order, as opposed to the sorted order
         std::vector<flag_info_t> flag_info;
-        std::string_view command_name;
 
         void unguarded_vflag(std::string_view name, std::string_view help,
                              parse_arg_t parse_arg)

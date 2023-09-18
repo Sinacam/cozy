@@ -29,7 +29,7 @@ int main(int argc, char** argv)
     parser.flag("-v", "containers take an arbitrary number of arguments", v);
     parser.flag("-h", "bool flags can be set by '-h=true' or '-h' but not '-h true'", h);
 
-    auto remaining = parser.parse(std::span{argv, argv + argc});
+    auto remaining = parser.parse(std::span{argv + 1, argv + argc});
     if(!remaining)
     {
         std::cerr << remaining.error();
@@ -37,7 +37,7 @@ int main(int argc, char** argv)
     }
     if(h)
     {
-        std::cout << parser.usage();
+        std::cout << "usage of program:\n" << parser.options();
         return 0;
     }
 }
