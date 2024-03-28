@@ -502,8 +502,8 @@ namespace cozy
         for(auto& [name, help, _] : flag_info)
         {
             auto dashes = name.size() > 1 ? "--"sv : "-"sv;
-            it = std::format_to(it, "    {:>{}}{}  ", dashes,
-                                longest - dashed_len(name) + 1, name);
+            it = std::format_to(it, "{:>{}}{}{}  ", ' ',
+                                longest - dashed_len(name) + 4, dashes, name);
 
             for(auto c : help)
             {
