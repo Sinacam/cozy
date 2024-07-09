@@ -2,7 +2,7 @@
 Cozy is a lightweight command line flag library for C++23. It is a single header `cozy.hpp`.
 
 ## Why C++23?
-Maintaining compatibility means there has to be compromises, which reduces usability. That is not the goal of this library.
+Because it is written for myself and I have up-to-date compilers.
 
 ## Modules?
 While I'd love to provide modules, gcc and clang still doesn't have full support as of writing, so no.
